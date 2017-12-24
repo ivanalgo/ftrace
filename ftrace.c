@@ -278,8 +278,8 @@ int load_process_maps(pid_t process)
 
 int insn_cmp(const void *a, const void *b)
 {
-	void **pa = a;
-	void **pb = b;
+	const void * const *pa = a;
+	const void * const *pb = b;
 
 	const struct insn *ia = *pa;
 	const struct insn *ib = *pb;
@@ -548,7 +548,7 @@ int call_executor(struct insn *insn, pid_t process, struct user_regs_struct *gpr
 int visit_code_section(void *obj, void *data)
 {
 	struct section *sec = obj;
-	pid_t process = (pid_t)data;
+	pid_t process = (pid_t)(unsigned long)data;
 	void *copy_mem;
 	int ret;
 	struct ud ud;
@@ -590,7 +590,7 @@ fail:
 
 void hook_sections(pid_t process)
 {
-	vector_visit(&code_section_vec, visit_code_section, (void *)process);
+	vector_visit(&code_section_vec, visit_code_section, (void *)(unsigned long)process);
 	vector_sort(&insn_vec, insn_cmp);
 }
 
@@ -654,7 +654,6 @@ int main(int argc, char *argv[])
 				}
 
 				int3_fault_fixup_pre(&gpregs);
-				//printf("RIP = %lx\n", gpregs.rip);
 				child_handle = handle_int3_fault(gpregs.rip, &gpregs, child);
 				ptrace(PTRACE_CONT, child, NULL, child_handle);
 			}
