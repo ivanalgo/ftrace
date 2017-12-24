@@ -14,6 +14,7 @@
 #include <libudis86/extern.h>
 #include <errno.h>
 #include <sys/user.h>
+#include <assert.h>
 
 
 typedef struct vector {
@@ -92,7 +93,7 @@ struct insn {
         struct ud ud;
         unsigned long address;
         unsigned int length;
-        char old_insn[16];
+        unsigned char old_insn[16];
         int (*executor)(struct insn *insn, pid_t process, struct user_regs_struct *gpregs);
 };
 
@@ -292,9 +293,17 @@ int insn_cmp(const void *a, const void *b)
 	return 0;
 }
 
-void int3_fault_fixup(struct user_regs_struct *gpregs)
+void int3_fault_fixup_pre(struct user_regs_struct *gpregs)
 {
 	gpregs->rip -= 1;	
+}
+
+void int3_fault_fixup_post(struct user_regs_struct *gpregs, struct insn *insn)
+{
+	if (insn)
+		gpregs->rip += insn->length;
+	else
+		gpregs->rip += 1;
 }
 
 int handle_int3_fault(unsigned long rip, struct user_regs_struct *gpregs, pid_t process)
@@ -306,6 +315,7 @@ int handle_int3_fault(unsigned long rip, struct user_regs_struct *gpregs, pid_t 
 
 	//printf("int3 fault at %lx\n", rip);
 	insn = vector_search(&insn_vec, &key, insn_cmp);
+	int3_fault_fixup_post(gpregs, insn);
 	if (!insn) {
 		/*
 		 * Process @process trap signal wasn't by our INT3
@@ -404,6 +414,52 @@ fail:
 
 }
 
+unsigned long reg_value(enum ud_type reg, struct user_regs_struct *gpregs)
+{
+	switch(reg) {
+	case UD_NONE:
+		return 0UL;
+	case UD_R_RAX:
+		return gpregs->rax;
+	case UD_R_RCX:
+		return gpregs->rcx;
+	case UD_R_RDX:
+		return gpregs->rdx;
+	case UD_R_RBX:
+		return gpregs->rbx;
+	case UD_R_RSP:
+		return gpregs->rsp;
+	case UD_R_RBP:
+		return gpregs->rbp;
+	case UD_R_RSI:
+		return gpregs->rsi;
+	case UD_R_RDI:
+		return gpregs->rdi;
+	case UD_R_R8:
+		return gpregs->r8;
+	case UD_R_R9:
+		return gpregs->r9;
+	case UD_R_R10: 
+		return gpregs->r10;
+	case UD_R_R11:
+		return gpregs->r11;
+	case UD_R_R12:
+		return gpregs->r12;
+	case UD_R_R13:
+		return gpregs->r13;
+	case UD_R_R14:
+		return gpregs->r14;
+	case UD_R_R15:
+		return gpregs->r15;
+	case UD_R_RIP:
+		return gpregs->rip;
+
+	default:
+		fprintf(stderr, "invalid regs %d\n", reg);
+		abort();
+	}
+}
+
 int call_executor(struct insn *insn, pid_t process, struct user_regs_struct *gpregs)
 {
 	unsigned long next_pc;
@@ -432,11 +488,47 @@ int call_executor(struct insn *insn, pid_t process, struct user_regs_struct *gpr
 
 		//printf("call imm\n");
 	} else if (insn->ud.operand[0].type == UD_OP_MEM) {
-		printf("another call\n");
-		return 0;
-	} else {
-		printf("another call\n");
-		return 0;
+		unsigned long taddr;
+		unsigned int base_reg = insn->ud.operand[0].base;
+		unsigned int index_reg = insn->ud.operand[0].index;
+		unsigned char scale = insn->ud.operand[0].scale;
+		unsigned long offset;
+
+		switch(insn->ud.operand[0].offset) {
+		case 64:
+			offset = insn->ud.operand[0].lval.uqword;
+			break;
+		case 32:
+			offset = insn->ud.operand[0].lval.udword;
+			break;
+		case 16:
+			offset = insn->ud.operand[0].lval.uword;
+			break;
+		case 8:
+			offset = insn->ud.operand[0].lval.ubyte;
+			break;
+		case 0:
+			offset = 0;
+			break;
+		default:
+			abort();
+		}
+
+		taddr = reg_value(base_reg, gpregs) + reg_value(index_reg, gpregs) * scale + offset;
+		assert(insn->ud.operand[0].size == 64);
+		ptrace_read_text(process, taddr, insn->ud.operand[0].size, &target_pc);
+	
+		printf("call mem\n");
+		int i;
+		for (i = 0; i < insn->length; ++i) {
+			printf("%02x ", insn->old_insn[i]);
+		}
+		printf("\n");
+	} else if (insn->ud.operand[0].type == UD_OP_REG) {
+		unsigned int reg = insn->ud.operand[0].base;
+		
+		target_pc = reg_value(reg, gpregs);
+		printf("call reg\n");
 	}
 
 	printf("Good: %lx call %lx\n", next_pc, target_pc);
@@ -449,6 +541,8 @@ int call_executor(struct insn *insn, pid_t process, struct user_regs_struct *gpr
 	gpregs->rip = target_pc;
 	ptrace_write_text(process, gpregs->rsp, sizeof(long), &next_pc);	
 	ptrace(PTRACE_SETREGS, process, NULL, gpregs);
+
+	return 0;
 }
 
 int visit_code_section(void *obj, void *data)
@@ -470,7 +564,7 @@ int visit_code_section(void *obj, void *data)
 	ud_set_mode(&ud, 64);
 	ud_set_input_buffer(&ud, copy_mem, sec->length);
 	while(ud_disassemble(&ud)) {
-                if (ud.mnemonic == UD_Icall && ud.operand[0].type == UD_OP_JIMM) {
+                if (ud.mnemonic == UD_Icall) {
                         struct insn *insn = malloc(sizeof(struct insn));
 			unsigned char bytes[16] = { 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
 				0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
@@ -559,10 +653,10 @@ int main(int argc, char *argv[])
 					fprintf(stderr, "ptrace getregs failed %m\n");
 				}
 
-				int3_fault_fixup(&gpregs);
+				int3_fault_fixup_pre(&gpregs);
 				//printf("RIP = %lx\n", gpregs.rip);
 				child_handle = handle_int3_fault(gpregs.rip, &gpregs, child);
-				ptrace(PTRACE_SINGLESTEP, child, NULL, 0);
+				ptrace(PTRACE_CONT, child, NULL, child_handle);
 			}
 
 		} else {
