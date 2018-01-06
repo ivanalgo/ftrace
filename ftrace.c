@@ -16,18 +16,32 @@
 #include <sys/user.h>
 #include <assert.h>
 
+extern int insn_cmp(const void *a, const void *b);
+extern int sym_cmp(const void *a, const void *b);
+int sym_find(const void *key, const void *data);
+
+typedef int (*cmp_t)(const void *a, const void *b);
 
 typedef struct vector {
 	size_t size;
 	size_t count;
 	void **array;
+	cmp_t cmp;
+	cmp_t finder;
 } vector_t;
 
-void vector_init(vector_t *vec)
+void vector_init(vector_t *vec, cmp_t cmp)
 {
 	vec->size = 16;
 	vec->count = 0;
 	vec->array = malloc(vec->size * sizeof(void *));
+	vec->cmp = cmp;
+	vec->finder = cmp;
+}
+
+void vector_finder(vector_t *vec, cmp_t finder)
+{
+	vec->finder = finder;
 }
 
 void vector_fini(vector_t *vec)
@@ -48,12 +62,12 @@ void vector_add(vector_t *vec, void *obj)
 	vec->array[vec->count++] = obj;
 }
 
-int vector_add_uniq(vector_t *vec, void *obj, int (*cmp)(void *obj, void *entry))
+int vector_add_uniq(vector_t *vec, void *obj)
 {
 	size_t i;
 
 	for (i = 0; i < vec->count; ++i) {
-		if (cmp(obj, vec->array[i]) == 0)
+		if (vec->cmp(&obj, &(vec->array[i])) == 0)
 			return -1;
 	}
 
@@ -73,16 +87,16 @@ int vector_visit(vector_t *vec, int (*visitor)(void *obj, void *data), void *dat
 	return 0;
 }
 
-void vector_sort(vector_t *vec, int (*cmp)(const void *a, const void *b))
+
+void vector_sort(vector_t *vec)
 {
-	qsort(vec->array, vec->count, sizeof(void *), cmp);	
+	qsort(vec->array, vec->count, sizeof(void *), vec->cmp);	
 }
 
-void *vector_search(vector_t *vec, const void *key,
-		int (*cmp)(const void *a, const void *b))
+void *vector_search(vector_t *vec, const void *key)
 {
 	void **entry;
-	entry = bsearch(&key, vec->array, vec->count, sizeof(void *), cmp);
+	entry = bsearch(&key, vec->array, vec->count, sizeof(void *), vec->finder);
 	if (!entry)
 		return NULL;
 
@@ -114,7 +128,7 @@ struct section * new_section(char *name, unsigned long address, unsigned long le
 		sec->name[sizeof(sec->name) - 1] = '\0';
 		sec->address = address;
 		sec->length = length;
-		vector_init(&sec->insn_vec);
+		vector_init(&sec->insn_vec, insn_cmp);
 	}
 
 	return sec;
@@ -123,6 +137,32 @@ struct section * new_section(char *name, unsigned long address, unsigned long le
 void free_section(struct section *sec)
 {
 	free(sec);
+}
+
+struct sym {
+	unsigned long address;
+	unsigned long size;
+	char *name;
+};
+
+struct sym * new_sym(unsigned long address, unsigned long size, const char *name)
+{
+	struct sym * sym;
+
+	sym = malloc(sizeof(struct sym));
+	if (!sym)
+		return sym;
+
+	sym->address = address;
+	sym->size = size;
+	sym->name = strdup(name);
+
+	if (!sym->name) {
+		free(sym);
+		sym = NULL;
+	}
+
+	return sym;
 }
 
 struct elf_obj {
@@ -140,7 +180,7 @@ struct elf_obj * new_elf_obj(char *file, unsigned long addr)
 		strncpy(elf->file, file, sizeof(elf->file) - 1);
 		elf->file[sizeof(elf->file) - 1] = '\0';
 		elf->load_address = addr;
-		vector_init(&elf->code_sec);
+		vector_init(&elf->code_sec, NULL);
 	}
 
 	return elf;
@@ -152,10 +192,13 @@ void free_elf_obj(struct elf_obj *elf)
 	free(elf);
 }
 
-int elf_obj_cmp(void *a, void *b)
+int elf_obj_cmp(const void *a, const void *b)
 {
-	struct elf_obj *oa = a;
-	struct elf_obj *ob = b;
+	const void * const *pa = a;
+	const void * const *pb = b;
+	
+	const struct elf_obj *oa = *pa;
+	const struct elf_obj *ob = *pb;
 
 	return strcmp(oa->file, ob->file);
 }
@@ -163,12 +206,15 @@ int elf_obj_cmp(void *a, void *b)
 vector_t code_section_vec;
 vector_t elf_obj_vec;
 vector_t insn_vec;
+vector_t sym_vec;
 
 void all_init()
 {
-	vector_init(&code_section_vec);
-	vector_init(&elf_obj_vec);
-	vector_init(&insn_vec);
+	vector_init(&code_section_vec, NULL);
+	vector_init(&elf_obj_vec, elf_obj_cmp);
+	vector_init(&insn_vec, insn_cmp);
+	vector_init(&sym_vec, sym_cmp);
+	vector_finder(&sym_vec, sym_find);
 }
 
 int load_elf_file(unsigned long address, char *file)
@@ -190,22 +236,19 @@ int load_elf_file(unsigned long address, char *file)
 		printf("get elf head failed: %s\n", elf_errmsg (-1));
 	}
 
-	//printf("elf head:\n");
-	//printf("elf type: %d\n", (int)ehdr_mem.e_type);
-
 	if (ehdr_mem.e_type == ET_EXEC) {
 		address = 0;  // exec elf, don't need to add a load address
 	}
 
 	elf_obj = new_elf_obj(file, address);	
-	if (vector_add_uniq(&elf_obj_vec, elf_obj, elf_obj_cmp)) {
+	if (vector_add_uniq(&elf_obj_vec, elf_obj)) {
 		// dup elf obj, don't add to vector, we should free here
 		free_elf_obj(elf_obj);
 		return 0;
 	}
 
 	// load elf execute section
-	for (section = 0; section < ehdr_mem.e_shstrndx; ++section) {
+	for (section = 0; section < ehdr_mem.e_shnum; ++section) {
 		GElf_Shdr shdr_mem;
 		Elf_Scn *scn = elf_getscn(elf, section);
 		gelf_getshdr(scn, &shdr_mem);
@@ -218,6 +261,27 @@ int load_elf_file(unsigned long address, char *file)
 
 			vector_add(&code_section_vec, sec);
 			vector_add(&elf_obj->code_sec, sec);
+		}
+
+		// this section is strtab section
+		if (shdr_mem.sh_type == SHT_SYMTAB ||
+			shdr_mem.sh_type == SHT_DYNSYM) {
+			Elf_Data *symdata = elf_getdata(scn, NULL);
+			GElf_Sym sym_mem;
+
+			size_t nsym = symdata->d_size / sizeof(Elf64_Sym);
+			size_t cnt;
+			for (cnt = 0; cnt < nsym; ++cnt) {
+				GElf_Sym *sym = gelf_getsym(symdata, cnt, &sym_mem);
+				if (ELF64_ST_TYPE(sym->st_info) == STT_FUNC
+					&& sym->st_value != 0 
+					&& sym->st_size != 0) {
+					struct sym *psym = new_sym(sym->st_value + address,
+								sym->st_size,
+								elf_strptr(elf, shdr_mem.sh_link, sym->st_name));
+					vector_add(&sym_vec, psym);
+				}
+			}
 		}
 	}	
 
@@ -263,12 +327,7 @@ int load_process_maps(pid_t process)
 		if (strchr(file, '[') && strchr(file, ']'))
 			continue;
 
-		// for debug, skip ld
-		//if (strstr(file, "ld"))
-		//	continue;
-
 		start_address = strtoul(range, NULL, 16);		
-		printf("maps: %lx %s\n", start_address, file);
 
 		load_elf_file(start_address, file);
 	}
@@ -293,6 +352,41 @@ int insn_cmp(const void *a, const void *b)
 	return 0;
 }
 
+int sym_cmp(const void *a, const void *b)
+{
+	const void * const *pa = a;
+	const void * const *pb = b;
+
+	const struct sym * syma = *pa;
+	const struct sym * symb = *pb;
+
+	if (syma->address > symb->address)
+		return 1;
+
+	if (syma->address < symb->address)
+		return -1;
+
+	return 0;
+}
+
+int sym_find(const void *key, const void *data)
+{
+	const void *const *pd = data;
+	const struct sym *sym = *pd;
+
+	const void * const *pk = *(void **)key;
+	unsigned long lkey = (unsigned long)pk;
+
+
+	if (lkey < sym->address)
+		return -1;
+
+	if (lkey > sym->address)
+		return 1;
+
+	return 0;
+}
+
 void int3_fault_fixup_pre(struct user_regs_struct *gpregs)
 {
 	gpregs->rip -= 1;	
@@ -313,8 +407,7 @@ int handle_int3_fault(unsigned long rip, struct user_regs_struct *gpregs, pid_t 
 
 	key.address = rip;
 
-	//printf("int3 fault at %lx\n", rip);
-	insn = vector_search(&insn_vec, &key, insn_cmp);
+	insn = vector_search(&insn_vec, &key);
 	int3_fault_fixup_post(gpregs, insn);
 	if (!insn) {
 		/*
@@ -517,21 +610,19 @@ int call_executor(struct insn *insn, pid_t process, struct user_regs_struct *gpr
 		taddr = reg_value(base_reg, gpregs) + reg_value(index_reg, gpregs) * scale + offset;
 		assert(insn->ud.operand[0].size == 64);
 		ptrace_read_text(process, taddr, insn->ud.operand[0].size, &target_pc);
-	
-		printf("call mem\n");
-		int i;
-		for (i = 0; i < insn->length; ++i) {
-			printf("%02x ", insn->old_insn[i]);
-		}
-		printf("\n");
 	} else if (insn->ud.operand[0].type == UD_OP_REG) {
 		unsigned int reg = insn->ud.operand[0].base;
-		
 		target_pc = reg_value(reg, gpregs);
-		printf("call reg\n");
 	}
 
-	printf("Good: %lx call %lx\n", next_pc, target_pc);
+	struct sym *caller, *callee;
+
+	caller = vector_search(&sym_vec, (void *)next_pc);
+	callee = vector_search(&sym_vec, (void *)target_pc);
+	printf("Call: %s %lx -> %s %lx\n", caller? caller->name : "NULL",
+				next_pc,
+				callee? callee->name : "NULL",
+				target_pc);
 	// begin to simulator call instruction
 	// call instructio behavior as:
 	// rsp sub 8
@@ -588,10 +679,21 @@ fail:
 	return ret;
 }
 
+int visit_sym(void *obj, void *data)
+{
+	struct sym *sym = obj;
+	printf("symbol: %s %lx %lx (%ld)\n", sym->name, sym->address, sym->size, sym->size);
+
+	return 0;
+}
+
 void hook_sections(pid_t process)
 {
 	vector_visit(&code_section_vec, visit_code_section, (void *)(unsigned long)process);
-	vector_sort(&insn_vec, insn_cmp);
+	vector_sort(&insn_vec);
+	vector_sort(&sym_vec);
+	printf("VISIT SYM\n");
+	vector_visit(&sym_vec, visit_sym, NULL);
 }
 
 int main(int argc, char *argv[])
