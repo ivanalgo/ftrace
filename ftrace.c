@@ -728,7 +728,6 @@ int visit_code_section(void *obj, void *data)
                         vector_add(&sec->insn_vec, insn);
 			vector_add(&insn_vec, insn);
 			ptrace_write_text(process, insn->address, insn->length, bytes);
-			printf("hook code: [%lx - %lx]\n", insn->address, insn->address + insn->length);
                 }
 	}
 
@@ -739,22 +738,12 @@ fail:
 	return ret;
 }
 
-int visit_sym(void *obj, void *data)
-{
-	struct sym *sym = obj;
-	printf("symbol: %s %lx %lx (%ld)\n", sym->name, sym->address, sym->size, sym->size);
-
-	return 0;
-}
-
 void hook_sections(pid_t process)
 {
 	vector_sort(&code_section_vec);
 	vector_visit(&code_section_vec, visit_code_section, (void *)(unsigned long)process);
 	vector_sort(&insn_vec);
 	vector_sort(&sym_vec);
-	printf("VISIT SYM\n");
-	vector_visit(&sym_vec, visit_sym, NULL);
 }
 
 int main(int argc, char *argv[])
