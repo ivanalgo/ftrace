@@ -16,6 +16,8 @@
 #include <sys/user.h>
 #include <assert.h>
 
+#define min(x, y) ((x) <= (y)? (x) : (y))
+
 extern int insn_cmp(const void *a, const void *b);
 extern int sym_cmp(const void *a, const void *b);
 extern int sym_find(const void *key, const void *data);
@@ -119,6 +121,9 @@ struct section {
 	vector_t insn_vec;
 	struct elf_obj *elf_obj;
 };
+
+static bool singlestep = 0;
+static struct insn *ss_insn = NULL;
 
 struct section * new_section(char *name, unsigned long address,
 			unsigned long length, struct elf_obj *elf)
@@ -275,9 +280,14 @@ int load_elf_file(unsigned long address, char *file)
 		return -1;
 	}
 
-	elf = elf_begin(fd, ELF_C_READ, NULL);
+	if ((elf = elf_begin(fd, ELF_C_READ, NULL)) == NULL) {
+		printf("elf_begin failed: %s\n", elf_errmsg(-1));
+		return -1;
+	}
+
 	if (gelf_getehdr(elf, &ehdr_mem) == NULL) {
 		printf("get elf head failed: %s\n", elf_errmsg (-1));
+		return -1;
 	}
 
 	if (ehdr_mem.e_type == ET_EXEC) {
@@ -291,6 +301,7 @@ int load_elf_file(unsigned long address, char *file)
 		return 0;
 	}
 
+	printf("load file %s file\n", file);
 	// load elf execute section
 	for (section = 0; section < ehdr_mem.e_shnum; ++section) {
 		GElf_Shdr shdr_mem;
@@ -432,38 +443,24 @@ int sym_find(const void *key, const void *data)
 	return 0;
 }
 
-void int3_fault_fixup_pre(struct user_regs_struct *gpregs)
-{
-	gpregs->rip -= 1;	
-}
-
-void int3_fault_fixup_post(struct user_regs_struct *gpregs, struct insn *insn)
-{
-	if (insn)
-		gpregs->rip += insn->length;
-	else
-		gpregs->rip += 1;
-}
-
-int handle_int3_fault(unsigned long rip, struct user_regs_struct *gpregs, pid_t process)
+int handle_int3_fault(struct user_regs_struct *gpregs,
+		pid_t process, unsigned long *action)
 {
 	struct insn *insn;
 	struct insn key;
 
-	key.address = rip;
+	// fixup fault rip
+	gpregs->rip -= 1;
+	key.address = gpregs->rip;
 
 	insn = vector_search(&insn_vec, &key);
-	int3_fault_fixup_post(gpregs, insn);
 	if (!insn) {
-		/*
-		 * Process @process trap signal wasn't by our INT3
-		 * let itself to handle this signal
-		 */
-		//printf("no found insn\n");
+		*action = PTRACE_CONT;
+		gpregs->rip += 1;
 		return 1;
 	}
 
-	insn->executor(insn, process, gpregs);
+	*action = insn->executor(insn, process, gpregs);
 	//printf("we should handle this trap\n");
 	return 0;
 
@@ -604,6 +601,8 @@ int call_executor(struct insn *insn, pid_t process, struct user_regs_struct *gpr
 	unsigned long target_pc;
 
 	next_pc = insn->address + insn->length;
+	// fixup rip to next instruction
+	gpregs->rip += insn->length;
 
 	if (insn->ud.operand[0].type  == UD_OP_JIMM) {
 		const uint64_t trunc_mask = 0xffffffffffffffffull >> (64 - insn->ud.opr_mode);
@@ -664,36 +663,67 @@ int call_executor(struct insn *insn, pid_t process, struct user_regs_struct *gpr
 	struct section *sec_caller, *sec_callee;
 
 	sym_caller = vector_search(&sym_vec, (void *)next_pc);
-	if (!sym_caller)
-			sec_caller = vector_search(&code_section_vec, (void *)next_pc);
+	sec_caller = vector_search(&code_section_vec, (void *)next_pc);
 
 	sym_callee = vector_search(&sym_vec, (void *)target_pc);
-	if (!sym_callee)
-			sec_callee = vector_search(&code_section_vec, (void *)target_pc);
+	sec_callee = vector_search(&code_section_vec, (void *)target_pc);
 
-
-	if (sym_caller)
-		printf("caller: %lx %s %s\n", next_pc, sym_caller->name,
-			sym_caller->elf_obj->file);
+	printf("caller: %lx %s (%s+%lx)\n",
+		next_pc, sym_caller? sym_caller->name : "",
+		sec_caller->elf_obj->file, next_pc - sec_caller->elf_obj->load_address);
+	if (sec_callee)
+		printf("-->callee: %lx %s (%s+%lx)\n",
+			target_pc, sym_callee? sym_callee->name: "",
+			sec_callee->elf_obj->file, target_pc - sec_callee->elf_obj->load_address);
 	else
-		printf("caller: %lx %s\n", next_pc, sec_caller->elf_obj->file);
-
-	if (sym_callee)
-		printf("-->callee: %lx %s %s\n", target_pc, sym_callee->name,
-			sym_callee->elf_obj->file);
-	else
-		printf("-->callee: %lx %s\n", target_pc, sec_callee->elf_obj->file);
+		printf("-->callee: %lx %s\n", target_pc, sym_callee? sym_callee->name: "");
 	// begin to simulator call instruction
-	// call instructio behavior as:
+	// call instruction behavior as:
 	// rsp sub 8
-	// move next_pc to rsp
-	// move target_pc to rip
+	// save next_pc to rsp
+	// set target_pc to rip
 	gpregs->rsp -= sizeof(long);
 	gpregs->rip = target_pc;
 	ptrace_write_text(process, gpregs->rsp, sizeof(long), &next_pc);	
 	ptrace(PTRACE_SETREGS, process, NULL, gpregs);
 
-	return 0;
+	return PTRACE_CONT;
+}
+
+int reset_breakpoint_executor(struct insn *insn, pid_t process, struct user_regs_struct *gpregs)
+{
+	unsigned char bytes[16] = { 0xCC, 0xCC, 0xCC, 0xCC,
+		0xCC, 0xCC, 0xCC, 0xCC,
+		0xCC, 0xCC, 0xCC, 0xCC,
+		0xCC, 0xCC, 0xCC, 0xCC };
+	ptrace_write_text(process, insn->address, insn->length, bytes);
+
+	return PTRACE_CONT;
+}
+
+int shlib_breakpoint_executor(struct insn *insn, pid_t process, struct user_regs_struct *gpregs)
+{
+	unsigned long pc = gpregs->rip;
+	// ld had loaded a new share library into the process address space
+	// need to reload the maps
+	printf("SHLIB: fault pc %lx\n", pc);
+	printf("new os...\n");
+	load_process_maps(process);
+
+	// restore the instruction
+	ptrace_write_text(process, insn->address, insn->length, insn->old_insn);
+
+	// After singlestep executor this instruction, Must reset this
+	// instruct to INT3 and make next breakpoint take affect
+
+	struct insn *insn_restore = malloc(sizeof(struct insn));
+	insn_restore->address = insn->address;
+	insn_restore->length = insn->length;
+	insn_restore->executor = reset_breakpoint_executor;
+
+	ss_insn = insn_restore;
+
+	return PTRACE_SINGLESTEP;
 }
 
 int visit_code_section(void *obj, void *data)
@@ -738,12 +768,81 @@ fail:
 	return ret;
 }
 
+int setup_shlib_breakpoint(void *obj, void *data)
+{
+	int i;
+	struct ud ud;
+	unsigned char copy_mem[16];
+	size_t len;
+	struct sym *sym = obj;
+	pid_t process = (pid_t)(unsigned long)data;
+
+	static const char * const solib_break_names[] =
+	{
+		"r_debug_state",
+		"_r_debug_state",
+		"_dl_debug_state",
+		"rtld_db_dlactivity",
+		"__dl_rtld_db_dlactivity",
+		"_rtld_debug_state",
+	};
+
+	#define SYMS (sizeof(solib_break_names)/sizeof(solib_break_names[0]))
+
+	if (strstr(sym->elf_obj->file, "ld-") == NULL)
+		return 0;
+
+	for (i = 0; i < SYMS; i++) {
+		if (strcmp(sym->name, solib_break_names[i]) == 0) {
+			printf("found debug status %s\n", solib_break_names[i]);
+			break;
+		}
+	}
+
+	if (i == SYMS)
+		return 0;
+	#undef SYMS
+
+	len = min(sizeof(copy_mem), sym->size);
+	ptrace_read_text(process, sym->address, len, copy_mem);
+
+	ud_init(&ud);
+	ud_set_mode(&ud, 64);
+	ud_set_input_buffer(&ud, copy_mem, len);
+	ud_disassemble(&ud);
+	struct insn *insn = malloc(sizeof(struct insn));
+	if (!insn)
+		return 1;
+
+	insn->address = sym->address + ud.insn_offset;
+	insn->length = ud.inp_ctr;
+	printf("SHLIB: breakpoint [%lx - %lx]\n", insn->address, insn->address + insn->length);
+	memcpy(insn->old_insn, copy_mem, insn->length);
+	insn->executor = shlib_breakpoint_executor;
+	vector_add(&insn_vec, insn);
+
+	// setup breakpoint
+        unsigned char bytes[16] = { 0xCC, 0xCC, 0xCC, 0xCC,
+                0xCC, 0xCC, 0xCC, 0xCC,
+                0xCC, 0xCC, 0xCC, 0xCC,
+                0xCC, 0xCC, 0xCC, 0xCC };
+        ptrace_write_text(process, insn->address, insn->length, bytes);
+
+	return 1;
+}
+
+void set_shlib_breakpoint(pid_t process)
+{
+	vector_visit(&sym_vec, setup_shlib_breakpoint, (void *)(unsigned long)process);
+}
+
 void hook_sections(pid_t process)
 {
 	vector_sort(&code_section_vec);
 	vector_visit(&code_section_vec, visit_code_section, (void *)(unsigned long)process);
-	vector_sort(&insn_vec);
 	vector_sort(&sym_vec);
+	set_shlib_breakpoint(process);
+	vector_sort(&insn_vec);
 }
 
 int main(int argc, char *argv[])
@@ -783,7 +882,8 @@ int main(int argc, char *argv[])
 
 		if (WIFSIGNALED(status)) {
 			/* child terminal by signal */
-			fprintf(stderr, "process %d terminal by signal\n", child);
+			fprintf(stderr, "process %d terminal by signal %d\n",
+				child, WTERMSIG(status));
 			exit(0);
 		}
 
@@ -799,15 +899,27 @@ int main(int argc, char *argv[])
 				hook_sections(child);
 				ptrace(PTRACE_CONT, child, NULL, NULL);
 			} else {
+				unsigned long action;
 				struct user_regs_struct gpregs;
 				int child_handle;
 				if (ptrace(PTRACE_GETREGS, child, NULL, &gpregs) < 0) {
 					fprintf(stderr, "ptrace getregs failed %m\n");
 				}
 
-				int3_fault_fixup_pre(&gpregs);
-				child_handle = handle_int3_fault(gpregs.rip, &gpregs, child);
-				ptrace(PTRACE_CONT, child, NULL, child_handle);
+				if (singlestep) {
+					singlestep = false;
+					struct insn *insn = ss_insn;
+					ss_insn = NULL;
+
+					insn->executor(insn, child, &gpregs);
+					ptrace(PTRACE_CONT, child, NULL, NULL);
+					free(insn);
+					continue;
+				}
+
+				child_handle = handle_int3_fault(&gpregs, child, &action);
+				singlestep = (action == PTRACE_SINGLESTEP);
+				ptrace(action, child, NULL, child_handle);
 			}
 
 		} else {
